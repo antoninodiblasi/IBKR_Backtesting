@@ -1,108 +1,240 @@
+# engine/backtest.py
+
+from datetime import time, datetime, date
+import pandas as pd
+
 from IBKR_Backtesting.engine.execution import ExecutionHandler
 from IBKR_Backtesting.engine.portfolio import Portfolio
-import pandas as pd
+from IBKR_Backtesting.engine.order import Order
+from IBKR_Backtesting.utils.performance import compute_performance, aggregate_daily_equity
+
 
 class BacktestEngine:
     """
-    Motore di backtesting.
-    Si occupa di:
-    - orchestrare il loop principale sul dataset
-    - richiamare la strategia per generare ordini
-    - simulare l'esecuzione tramite l'ExecutionHandler
-    - aggiornare il portafoglio e costruire l'equity curve
-    - calcolare metriche di performance
+    Motore di backtesting multiday.
+
+    Funzionalità:
+    - Itera sulle barre storiche (es. 1-min OHLCV + bid/ask se disponibile).
+    - Richiama la strategia per generare ordini.
+    - Simula l’esecuzione con ExecutionHandler.
+    - Aggiorna portafoglio ed equity curve.
+    - Registra snapshot giornalieri (Mark-to-Market alle 17:15).
+    - Opzionale: forza chiusura posizioni a fine giornata.
     """
 
-    def __init__(self, strategy, data, symbol, initial_cash, slippage=0.0, commission=0.0):
+    def __init__(
+        self,
+        strategy,
+        data: pd.DataFrame,
+        symbol: str,
+        initial_cash: float,
+        slippage: float = 0.0,
+        commission: float = 0.0,
+        m2m_time: time = time(17, 15),
+        market_close_time: time = time(17, 30),
+        flatten_at_close: bool = False,
+    ):
         """
         Parameters
         ----------
         strategy : object
-            Strategia che implementa il metodo on_bar(bar).
-        data : pandas.DataFrame
-            Serie storica del sottostante, con colonne ['timestamp','open','high','low','close','volume'].
+            Strategia con metodo `on_bar(bar) -> list[Order]`.
+        data : pd.DataFrame
+            Dati storici con almeno:
+            ['timestamp','open','high','low','close','volume'].
+            Se presenti: ['bid','ask','mid'].
         symbol : str
-            Ticker/identificativo del sottostante.
+            Ticker sottostante.
         initial_cash : float
-            Capitale iniziale per il portafoglio.
-        slippage : float, optional
-            Percentuale di slippage da applicare sul prezzo di esecuzione (default=0.0).
-        commission : float, optional
-            Commissione fissa per trade (default=0.0).
+            Capitale iniziale.
+        slippage : float
+            Slippage percentuale.
+        commission : float
+            Commissione fissa per trade.
+        m2m_time : datetime.time
+            Orario per il Mark-to-Market giornaliero.
+        market_close_time : datetime.time
+            Orario di chiusura mercato (default 17:30).
+        flatten_at_close : bool
+            Se True forza flat a fine giornata.
         """
         self.strategy = strategy
         self.data = data
         self.symbol = symbol
-        self.portfolio = Portfolio(cash=initial_cash)
-        # Gestore esecuzione: simula market/limit order con slippage/commissioni
+        self.initial_cash = float(initial_cash)
+
+        # Oggetti interni
+        self.portfolio = Portfolio(cash=self.initial_cash)
         self.execution = ExecutionHandler(self.portfolio, slippage, commission)
-        self.filled_orders = []   # lista ordini effettivamente eseguiti
-        self.equity_curve = []    # lista snapshot equity (uno per ogni barra)
+
+        # Storage
+        self.filled_orders = []   # ordini eseguiti
+        self.equity_curve = []    # equity intraday
+        self.daily_store = []     # record giornalieri (M2M + chiusure)
+
+        # Configurazioni giornaliere
+        self.m2m_time = m2m_time
+        self.market_close_time = market_close_time
+        self.flatten_at_close = bool(flatten_at_close)
+
+        # Stato interno
+        self._last_day: date | None = None
+        self._m2m_done_for_day: set[date] = set()
+
+    # -------------------------------------------------------------------------
+    # METODI INTERNI
+    # -------------------------------------------------------------------------
+
+    def _get_bar_price(self, bar) -> float:
+        """Determina prezzo di riferimento (mid se disponibile, altrimenti close)."""
+        if hasattr(bar, "mid") and bar.mid is not None:
+            return float(bar.mid)
+        if hasattr(bar, "close") and bar.close is not None:
+            return float(bar.close)
+        return float("nan")
+
+    def _snapshot(self, px: float, ts: datetime) -> dict:
+        """Registra snapshot equity e lo salva nell’equity_curve."""
+        snap = self.portfolio.snapshot_equity({self.symbol: px}, ts)
+        self.equity_curve.append(snap)
+        return snap
+
+    def _ensure_m2m(self, bar):
+        """Assicura Mark-to-Market alla prima barra >= m2m_time."""
+        d = bar.timestamp.date()
+        if d not in self._m2m_done_for_day and bar.timestamp.time() >= self.m2m_time:
+            px = self._get_bar_price(bar)
+            m2m_snap = self._snapshot(px, bar.timestamp)
+            self.daily_store.append({
+                "date": d,
+                "timestamp": bar.timestamp,
+                "equity_m2m": m2m_snap["equity"],
+                "note": "m2m"
+            })
+            self._m2m_done_for_day.add(d)
+
+    def _close_day(self, bar):
+        """
+        Chiusura di fine giornata:
+        - Flat forzato se richiesto
+        - M2M se non già fatto
+        - Registra marker di chiusura
+        """
+        d = bar.timestamp.date()
+
+        # Flat forzato
+        if self.flatten_at_close:
+            pos = self._get_position(self.symbol)
+            if pos != 0:
+                side = "SELL" if pos > 0 else "BUY"
+                qty = abs(pos)
+                close_order = Order(
+                    self.symbol, side, qty,
+                    float(self._get_bar_price(bar)),
+                    bar.timestamp, "MARKET"
+                )
+                filled, exec_price = self.execution.execute_order(self.symbol, close_order, bar)
+                if filled:
+                    close_order.timestamp = bar.timestamp
+                    close_order.price = exec_price
+                    self.filled_orders.append(close_order)
+                    self._snapshot(self._get_bar_price(bar), bar.timestamp)
+
+        # Se M2M non fatto prima, fallo ora
+        if d not in self._m2m_done_for_day:
+            px = self._get_bar_price(bar)
+            m2m_snap = self._snapshot(px, bar.timestamp)
+            self._m2m_done_for_day.add(d)
+            self.daily_store.append({
+                "date": d,
+                "timestamp": bar.timestamp,
+                "equity_m2m": m2m_snap["equity"],
+                "note": "m2m_at_close"
+            })
+
+        # Marker di chiusura
+        self.daily_store.append({
+            "date": d,
+            "timestamp": bar.timestamp,
+            "equity_close": self.equity_curve[-1]["equity"],
+            "note": "close"
+        })
+
+    def _day_changed(self, current_ts: datetime) -> bool:
+        """Rileva cambio giorno per gestire multiday."""
+        cd = current_ts.date()
+        changed = self._last_day is not None and cd != self._last_day
+        self._last_day = cd
+        return changed
+
+    def _get_position(self, symbol: str) -> int:
+        """Ritorna posizione corrente del portafoglio sul simbolo."""
+        if hasattr(self.portfolio, "get_position"):
+            return int(self.portfolio.get_position(symbol))
+        if hasattr(self.portfolio, "positions"):
+            return int(self.portfolio.positions.get(symbol, 0))
+        return 0
+
+    # -------------------------------------------------------------------------
+    # API PRINCIPALI
+    # -------------------------------------------------------------------------
 
     def run(self):
-        """
-        Esegue il loop principale del backtest.
-        Per ogni barra:
-        - genera eventuali ordini dalla strategia
-        - li esegue tramite ExecutionHandler
-        - aggiorna equity curve con snapshot mark-to-market
-        """
-        # snapshot iniziale: equity = solo cash, nessuna posizione
-        first_bar = self.data.iloc[0]
-        snapshot = self.portfolio.snapshot_equity(
-            {self.symbol: first_bar.close}, first_bar.timestamp
-        )
-        self.equity_curve.append(snapshot)
+        """Esegue il backtest iterando sulle barre."""
+        if len(self.data) == 0:
+            return
 
-        # loop su tutte le barre del dataset
+        # Snapshot iniziale
+        first = self.data.iloc[0]
+        self._last_day = first.timestamp.date()
+        self._snapshot(self._get_bar_price(first), first.timestamp)
+
+        # Loop principale
         for bar in self.data.itertuples(index=False):
-            # strategia produce ordini
-            orders = self.strategy.on_bar(bar)
-            if orders:
-                for order in orders:
-                    filled, exec_price = self.execution.execute_order(self.symbol, order, bar)
-                    if filled:
-                        # aggiorniamo l'ordine con info effettive
-                        order.timestamp = bar.timestamp
-                        order.price = exec_price
-                        self.filled_orders.append(order)
+            # Cambio giorno → marker (chiusura gestita a fine giornata)
+            if self._day_changed(bar.timestamp):
+                pass
 
-            # snapshot equity: cash + valore mark-to-market posizioni
-            snapshot = self.portfolio.snapshot_equity(
-                {self.symbol: bar.close}, bar.timestamp
-            )
-            self.equity_curve.append(snapshot)
+            # Strategia genera ordini
+            orders = self.strategy.on_bar(bar) or []
+            for order in orders:
+                filled, exec_price = self.execution.execute_order(self.symbol, order, bar)
+                if filled:
+                    order.timestamp = bar.timestamp
+                    order.price = exec_price
+                    self.filled_orders.append(order)
 
-    def report(self, initial_cash):
+            # Snapshot intraday
+            self._snapshot(self._get_bar_price(bar), bar.timestamp)
+
+            # M2M
+            self._ensure_m2m(bar)
+
+            # Chiusura giornaliera
+            if bar.timestamp.time() >= self.market_close_time:
+                self._close_day(bar)
+
+        # --- FIX: chiudi anche l’ultimo giorno ---
+        last_bar = self.data.iloc[-1]
+        self._close_day(last_bar)
+
+    def report(self):
         """
-        Costruisce DataFrame equity e calcola metriche di performance.
-
-        Returns
-        -------
-        equity_df : pandas.DataFrame
-            Serie temporale di equity mark-to-market.
-        metrics : dict
-            Dizionario con metriche: Total Return, Volatility, Sharpe, Max Drawdown.
-        filled_orders : list
-            Lista ordini eseguiti con timestamp e prezzo.
+        Ritorna:
+        - equity intraday
+        - equity giornaliera M2M
+        - metriche performance
+        - ordini eseguiti
+        - store giornaliero
         """
-        equity_df = pd.DataFrame(self.equity_curve).set_index("timestamp")
+        # Equity intraday
+        equity_df = pd.DataFrame(self.equity_curve).sort_values("timestamp")
+        equity_df = equity_df.set_index("timestamp", drop=False)
 
-        # calcolo metriche base di performance
-        returns = equity_df["equity"].pct_change().fillna(0)
-        total_return = (equity_df["equity"].iloc[-1] / initial_cash - 1) * 100
-        volatility = returns.std() * (252 ** 0.5) * 100  # annualizzata
-        sharpe = returns.mean() / returns.std() * (252 ** 0.5) if returns.std() != 0 else 0
-        cumulative = (1 + returns).cumprod()
-        peak = cumulative.cummax()
-        drawdown = (cumulative - peak) / peak
-        max_drawdown = drawdown.min() * 100
+        # Performance
+        _, metrics = compute_performance(self.portfolio.history, self.initial_cash)
 
-        metrics = {
-            "Total Return %": round(total_return, 3),
-            "Volatility %": round(volatility, 3),
-            "Sharpe Ratio": round(sharpe, 3),
-            "Max Drawdown %": round(max_drawdown, 3)
-        }
+        # Giornaliero M2M
+        daily_df = aggregate_daily_equity(equity_df, m2m_time=self.m2m_time)
 
-        return equity_df, metrics, self.filled_orders
+        return equity_df, daily_df, metrics, self.filled_orders, pd.DataFrame(self.daily_store)

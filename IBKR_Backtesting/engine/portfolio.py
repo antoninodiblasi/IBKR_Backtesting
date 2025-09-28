@@ -1,93 +1,168 @@
-# engine/portfolio.py
-
 class Portfolio:
     """
     Rappresenta il portafoglio durante il backtest.
+
     Tiene traccia di:
-    - cash disponibile
-    - posizioni aperte (per simbolo)
-    - storico delle operazioni eseguite
+    - liquidità disponibile (cash)
+    - posizioni aperte per simbolo (quantità e prezzo medio di carico)
+    - storico dettagliato delle operazioni eseguite
     - equity mark-to-market tramite snapshot
     """
 
-    def __init__(self, cash):
+    def __init__(self, cash: float = 0.0, base_currency: str = "USD"):
         """
         Parameters
         ----------
         cash : float
             Capitale iniziale disponibile.
+        base_currency : str
+            Valuta di riferimento del portafoglio (default: "USD").
         """
-        self.cash = cash
-        self.positions = {}   # dict {symbol: qty} → quantità netta per ogni titolo
-        self.history = []     # lista di dict → log delle operazioni eseguite
+        self.cash = float(cash)
+        self.base_currency = base_currency
 
-    def update_position(self, symbol, qty, price, side, timestamp=None):
+        # Dizionario delle posizioni correnti
+        # symbol -> qty netta
+        self.positions: dict[str, int] = {}
+
+        # Prezzo medio di carico per ogni simbolo
+        # symbol -> avg price
+        self.avg_price: dict[str, float] = {}
+
+        # Storico di tutte le operazioni (ogni fill applicato)
+        self.history: list[dict] = []
+
+    # -------------------------------------------------------------------------
+    # METODI PUBBLICI
+    # -------------------------------------------------------------------------
+
+    def get_position(self, symbol: str) -> int:
         """
-        Aggiorna il portafoglio in seguito a un'esecuzione d'ordine.
-
-        Parameters
-        ----------
-        symbol : str
-            Nome/ticker del titolo.
-        qty : int or float
-            Quantità eseguita.
-        price : float
-            Prezzo di esecuzione.
-        side : str
-            "BUY" o "SELL".
-        timestamp : datetime, optional
-            Momento dell'operazione.
+        Restituisce la quantità netta detenuta su un simbolo.
         """
-        if side == "BUY":
-            # comprare riduce il cash ed aumenta la posizione netta
-            self.cash -= qty * price
-            self.positions[symbol] = self.positions.get(symbol, 0) + qty
-        elif side == "SELL":
-            # vendere aumenta il cash e riduce la posizione netta
-            self.cash += qty * price
-            self.positions[symbol] = self.positions.get(symbol, 0) - qty
+        return int(self.positions.get(symbol, 0))
 
-        # registriamo l’operazione nello storico
-        self.history.append({
-            "symbol": symbol,
-            "side": side,
-            "qty": qty,
-            "price": price,
-            "cash": self.cash,
-            "timestamp": timestamp
-        })
-
-    def snapshot_equity(self, prices, timestamp):
+    def mark_to_market(self, prices: dict[str, float]) -> float:
         """
-        Calcola lo stato completo del portafoglio in un dato momento.
+        Calcola l'equity mark-to-market = cash + valore posizioni aperte.
 
         Parameters
         ----------
         prices : dict
             Mappa {symbol: price} con i prezzi correnti.
-        timestamp : datetime
+
+        Returns
+        -------
+        float
+            Equity corrente mark-to-market.
+        """
+        equity = self.cash
+        for sym, qty in self.positions.items():
+            px = prices.get(sym)
+            if px is not None:
+                equity += qty * px
+        return equity
+
+    def apply_fill(self, symbol: str, side: str, qty: int, price: float, ts):
+        """
+        Aggiorna lo stato del portafoglio in seguito a un'esecuzione (fill).
+
+        Parameters
+        ----------
+        symbol : str
+            Nome/ticker del titolo.
+        side : str
+            Direzione: "BUY" o "SELL".
+        qty : int
+            Quantità eseguita.
+        price : float
+            Prezzo di esecuzione.
+        ts : datetime
+            Timestamp del fill.
+        """
+        # Normalizziamo il lato
+        side = side.upper()
+        signed_qty = qty if side == "BUY" else -qty
+
+        # Recupero posizione precedente e prezzo medio
+        prev_qty = self.positions.get(symbol, 0)
+        prev_avg = self.avg_price.get(symbol, 0.0)
+
+        # Nuova quantità netta dopo l'operazione
+        new_qty = prev_qty + signed_qty
+
+        # ------------------- Aggiornamento cash -------------------
+        # BUY: cash diminuisce
+        # SELL: cash aumenta
+        trade_cash = -signed_qty * price
+        self.cash += trade_cash
+
+        # ------------------- Prezzo medio -------------------------
+        if new_qty != 0:
+            if prev_qty == 0:
+                # Apertura di una nuova posizione
+                new_avg = price
+            elif (prev_qty > 0 and signed_qty > 0) or (prev_qty < 0 and signed_qty < 0):
+                # Aumento della posizione esistente (stesso segno)
+                new_avg = (prev_avg * abs(prev_qty) + price * abs(signed_qty)) / abs(new_qty)
+            else:
+                # Riduzione della posizione: mantieni lo stesso avg
+                new_avg = prev_avg
+            self.avg_price[symbol] = new_avg
+        else:
+            # Posizione chiusa → reset prezzo medio
+            self.avg_price[symbol] = 0.0
+
+        # Aggiorno la posizione netta
+        self.positions[symbol] = new_qty
+
+        # ------------------- Realized PnL -------------------------
+        realized_pnl = 0.0
+        if prev_qty != 0 and ((prev_qty > 0 and signed_qty < 0) or (prev_qty < 0 and signed_qty > 0)):
+            # Sto chiudendo (parzialmente o totalmente) una posizione
+            close_qty = min(abs(prev_qty), abs(signed_qty))
+            # PnL = quantità chiusa * differenza prezzo * direzione
+            realized_pnl = close_qty * (price - prev_avg) * (1 if prev_qty > 0 else -1)
+
+        # ------------------- Storico ------------------------------
+        self.history.append({
+            "timestamp": ts,
+            "symbol": symbol,
+            "side": side,
+            "qty": int(qty),
+            "price": float(price),
+            "cash": float(self.cash),
+            "position": int(new_qty),
+            "avg_price": float(self.avg_price[symbol]),
+            "realized_pnl": float(realized_pnl),
+        })
+
+    def snapshot_equity(self, prices: dict[str, float], ts):
+        """
+        Restituisce uno snapshot dello stato del portafoglio.
+
+        Parameters
+        ----------
+        prices : dict
+            Prezzi correnti {symbol: price}.
+        ts : datetime
             Momento dello snapshot.
 
         Returns
         -------
         dict
-            Stato del portafoglio con:
+            Con:
             - timestamp
-            - equity (cash + valore mark-to-market delle posizioni aperte)
+            - equity (cash + valore posizioni)
             - cash
-            - positions (copia del dict delle posizioni)
+            - positions (copia)
         """
-        # equity = cash + somma di (qty * prezzo corrente) per ogni titolo
-        portfolio_value = self.cash
-        for symbol, qty in self.positions.items():
-            if symbol in prices:
-                portfolio_value += qty * prices[symbol]
-
+        eq = self.mark_to_market(prices)
         return {
-            "timestamp": timestamp,
-            "equity": portfolio_value,
+            "timestamp": ts,
+            "equity": eq,
             "cash": self.cash,
-            "positions": dict(self.positions)  # copia per evitare mutazioni future
+            "positions": dict(self.positions),  # copia
         }
 
     def __repr__(self):
@@ -95,4 +170,4 @@ class Portfolio:
         Rappresentazione leggibile del portafoglio.
         Mostra cash e posizioni correnti.
         """
-        return f"Portfolio(cash={self.cash}, positions={self.positions})"
+        return f"Portfolio(cash={self.cash:.2f}, positions={self.positions})"

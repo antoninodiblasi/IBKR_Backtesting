@@ -1,56 +1,87 @@
+# main.py
+
+import pandas as pd
 from IBKR_Backtesting.strategies.dummy_strategy import SP500DummyStrategy
 from IBKR_Backtesting.engine.backtest import BacktestEngine
 from IBKR_Backtesting.utils.plotting import plot_backtest
 from IBKR_Backtesting.utils.ibkr_client import IBKRClient
-from IBKR_Backtesting.utils.data_handler import prepare_dataframe
+from IBKR_Backtesting.utils.data_handler import prepare_dataframe, merge_bidask_to_bars
 
-import pandas as pd
 
 if __name__ == "__main__":
     # ==============================
-    # INIZIALIZZA STRATEGIA
+    # INIZIALIZZA STRATEGIA E CONFIG
     # ==============================
-    strategy = SP500DummyStrategy()  # contiene già symbol, date, cash, ecc.
+    strategy = SP500DummyStrategy()
     cfg = strategy.get_config()
 
-    print("="*60)
+    print("=" * 60)
     print(f"Backtest run for {cfg['symbol']}")
     print(f"Date range: {cfg['start_date']} → {cfg['end_date']}")
     print(f"Initial cash: {cfg['initial_cash']}")
-    print("="*60)
+    print("=" * 60)
 
     # ==============================
     # CONNESSIONE IBKR
     # ==============================
-    client = IBKRClient(host="127.0.0.1", port=7497, client_id=1)
+    client = IBKRClient(
+        host=cfg.get("host", "127.0.0.1"),
+        port=cfg.get("port", 7497),
+        client_id=cfg.get("client_id", 1)
+    )
 
-    # calcoliamo durata e fine
-    start_dt = pd.to_datetime(strategy.start_date)
-    end_dt = pd.to_datetime(strategy.end_date)
+    # ==============================
+    # CALCOLO PARAMETRI PER IBKR
+    # ==============================
+    start_dt = pd.to_datetime(cfg["start_date"])
+    end_dt = pd.to_datetime(cfg["end_date"])
     days = (end_dt - start_dt).days + 1
     duration_str = f"{days} D"
 
-    # end_datetime in formato IBKR (fine della giornata finale)
+    # IBKR vuole endDateTime al giorno successivo
     end_datetime = (end_dt + pd.Timedelta(days=1)).strftime("%Y%m%d %H:%M:%S")
 
     # ==============================
-    # DOWNLOAD DATI
+    # DOWNLOAD BARRE OHLCV
     # ==============================
     raw_df = client.get_historical_data(
-        symbol=strategy.symbol,
-        exchange="SMART",
-        currency="USD",
-        end_datetime=end_datetime,   # <<< nuovo parametro
+        symbol=cfg["symbol"],
+        exchange=cfg["exchange"],
+        currency=cfg["currency"],
+        end_datetime=end_datetime,
         duration=duration_str,
-        bar_size="1 min"
+        bar_size=cfg["bar_size"]
+    )
+    bars = prepare_dataframe(raw_df)
+
+    print("\n[CHECK] Preview of downloaded bars:")
+    print(f"Range effettivo: {bars['timestamp'].min()} → {bars['timestamp'].max()}")
+    print(bars.head())
+    print(bars.tail())
+
+    # ==============================
+    # DOWNLOAD TICK BID/ASK (opzionale)
+    # ==============================
+    print("\n[INFO] Scarico tick BID/ASK da IBKR...")
+    ticks = client.get_historical_bidask_ticks(
+        symbol=cfg["symbol"],
+        exchange=cfg["exchange"],
+        currency=cfg["currency"],
+        start_dt=start_dt.strftime("%Y%m%d %H:%M:%S"),
+        end_dt=end_dt.strftime("%Y%m%d %H:%M:%S"),
+        batch_size=1000
     )
 
-    data = prepare_dataframe(raw_df)
+    if not ticks.empty:
+        ticks_file = f"book_{cfg['symbol']}_{cfg['start_date']}_{cfg['end_date']}.csv"
+        ticks.to_csv(ticks_file, index=False)
+        print(f"[INFO] Salvati {len(ticks)} tick BID/ASK in {ticks_file}")
 
-    print("\n[CHECK] Preview of downloaded DataFrame:")
-    print(f"Range effettivo: {data['timestamp'].min()} → {data['timestamp'].max()}")
-    print(data.head())
-    print(data.tail())
+        # Merge dei tick BID/ASK con le barre OHLCV
+        data = merge_bidask_to_bars(bars, ticks, on_col="timestamp")
+    else:
+        print("[WARN] Nessun tick BID/ASK scaricato, uso solo OHLCV.")
+        data = bars
 
     # ==============================
     # BACKTEST ENGINE
@@ -58,12 +89,12 @@ if __name__ == "__main__":
     engine = BacktestEngine(
         strategy=strategy,
         data=data,
-        symbol=strategy.symbol,
-        initial_cash=strategy.initial_cash
+        symbol=cfg["symbol"],
+        initial_cash=cfg["initial_cash"]
     )
     engine.run()
 
-    portfolio_df, metrics, orders = engine.report(initial_cash=strategy.initial_cash)
+    equity_df, daily_df, metrics, orders, daily_store = engine.report()
 
     # ==============================
     # RISULTATI
@@ -77,8 +108,8 @@ if __name__ == "__main__":
     # ==============================
     plot_backtest(
         price_df=data,
-        equity_df=portfolio_df,
+        equity_df=equity_df,
         orders=orders,
-        start_date=strategy.start_date,
-        end_date=strategy.end_date
+        start_date=cfg["start_date"],
+        end_date=cfg["end_date"]
     )
