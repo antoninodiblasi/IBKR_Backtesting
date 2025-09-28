@@ -8,7 +8,6 @@ from IBKR_Backtesting.engine.execution import ExecutionHandler
 from IBKR_Backtesting.engine.portfolio import Portfolio
 from IBKR_Backtesting.engine.order import Order
 from IBKR_Backtesting.engine.bar import Bar
-from IBKR_Backtesting.utils.performance import compute_performance, aggregate_daily_equity
 
 
 class BacktestEngine:
@@ -232,22 +231,73 @@ class BacktestEngine:
         self._close_day(last_bar)
 
     def report(self):
-        """
-        Ritorna:
-        - equity intraday
-        - equity giornaliera M2M
-        - metriche performance
-        - ordini eseguiti
-        - store giornaliero
-        """
-        # Equity intraday
-        equity_df = pd.DataFrame(self.equity_curve).sort_values("timestamp")
-        equity_df = equity_df.set_index("timestamp", drop=False)
+        import pandas as pd
+        import numpy as np
 
-        # Performance
-        _, metrics = compute_performance(self.portfolio.history, self.initial_cash)
+        # -------------------------
+        # 1. Equity intraday
+        # -------------------------
+        eq = pd.DataFrame(self.equity_curve)
 
-        # Giornaliero M2M
-        daily_df = aggregate_daily_equity(equity_df, m2m_time=self.m2m_time)
+        if not eq.empty:
+            eq["timestamp"] = pd.to_datetime(eq["timestamp"])
+            eq = eq.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+        else:
+            eq = pd.DataFrame(columns=["timestamp", "equity", "cash", "positions"])
 
-        return equity_df, daily_df, metrics, self.filled_orders, pd.DataFrame(self.daily_store)
+        # Allineo equity agli stessi timestamp delle barre
+        px_ts = pd.to_datetime(self.data["timestamp"])
+        equity_df = (
+            eq.set_index("timestamp")
+            .reindex(px_ts)
+            .ffill()
+            .rename_axis("timestamp")
+            .reset_index()
+        )
+
+        # -------------------------
+        # 2. Equity daily
+        # -------------------------
+        if not equity_df.empty:
+            daily_df = (
+                equity_df.set_index("timestamp")["equity"]
+                .resample("1D").last()
+                .dropna()
+                .reset_index()
+            )
+        else:
+            daily_df = pd.DataFrame(columns=["timestamp", "equity"])
+
+        # -------------------------
+        # 3. Metriche base
+        # -------------------------
+        if not equity_df.empty:
+            start_eq = float(equity_df["equity"].iloc[0])
+            end_eq = float(equity_df["equity"].iloc[-1])
+            total_pnl = end_eq - start_eq
+            ret_series = equity_df["equity"].pct_change().dropna()
+            max_dd = float(((equity_df["equity"].cummax() - equity_df["equity"]) / equity_df["equity"].cummax()).max())
+            sharpe = float(np.sqrt(252) * ret_series.mean() / (ret_series.std() + 1e-12))
+        else:
+            start_eq = end_eq = total_pnl = max_dd = sharpe = 0.0
+
+        metrics = {
+            "Start Equity": start_eq,
+            "End Equity": end_eq,
+            "Total PnL": total_pnl,
+            "Max Drawdown": max_dd,
+            "Sharpe Ratio": sharpe,
+        }
+
+        # -------------------------
+        # 4. daily_store (se serve per salvataggi Excel o altre elaborazioni)
+        # -------------------------
+        daily_store = {
+            "equity": daily_df,
+            # puoi aggiungere altri breakdown giornalieri qui
+        }
+
+        # -------------------------
+        # 5. Return coerente
+        # -------------------------
+        return equity_df, daily_df, metrics, self.filled_orders, daily_store

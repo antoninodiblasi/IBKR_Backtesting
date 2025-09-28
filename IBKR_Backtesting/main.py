@@ -6,7 +6,7 @@ from pathlib import Path
 from time import perf_counter
 import pandas as pd
 
-from IBKR_Backtesting.strategies.dummy_strategy import SP500DummyStrategy
+from IBKR_Backtesting.strategies.dummy_strategy import BuyHoldStrategy
 from IBKR_Backtesting.engine.backtest import BacktestEngine
 from IBKR_Backtesting.utils.plotting import plot_backtest
 from IBKR_Backtesting.utils.ibkr_client import IBKRClient
@@ -51,10 +51,8 @@ def _require_non_empty(df: pd.DataFrame, what: str) -> None:
 def fetch_bars(client: IBKRClient, cfg: dict) -> pd.DataFrame:
     start_dt = pd.to_datetime(cfg["start_date"])
     end_dt = pd.to_datetime(cfg["end_date"])
-    # Giorni inclusivi per IBKR
     days = (end_dt - start_dt).days + 1
     duration_str = f"{days} D"
-    # IBKR richiede endDateTime puntato al giorno successivo
     end_datetime = (end_dt + pd.Timedelta(days=1)).strftime("%Y%m%d %H:%M:%S")
 
     _info("Scarico barre OHLCV...")
@@ -96,12 +94,10 @@ def fetch_and_merge_ticks(
         _warn("Nessun tick BID/ASK scaricato. Uso solo OHLCV.")
         return bars
 
-    # Persistenza opzionale per debug/audit
     out_file = Path(f"book_{cfg['symbol']}_{cfg['start_date']}_{cfg['end_date']}.csv")
     ticks.to_csv(out_file, index=False)
     _info(f"Salvati {len(ticks)} tick BID/ASK in {out_file.name}")
 
-    # Merge tick→bar sul timestamp
     data = merge_bidask_to_bars(bars, ticks, on_col="timestamp")
     _require_non_empty(data, "Dataset unito OHLCV+BID/ASK")
     return data
@@ -110,7 +106,7 @@ def fetch_and_merge_ticks(
 # -----------------------------------------------------------------------------
 # Esecuzione backtest + report
 # -----------------------------------------------------------------------------
-def run_backtest(strategy: SP500DummyStrategy, data: pd.DataFrame, cfg: dict):
+def run_backtest(strategy: BuyHoldStrategy, data: pd.DataFrame, cfg: dict):
     engine = BacktestEngine(
         strategy=strategy,
         data=data,
@@ -123,6 +119,7 @@ def run_backtest(strategy: SP500DummyStrategy, data: pd.DataFrame, cfg: dict):
     dt_run = perf_counter() - t0
     _info(f"Backtest completato in {dt_run:.2f}s")
 
+    # report() DEVE restituire sempre 5 valori
     equity_df, daily_df, metrics, orders, daily_store = engine.report()
     return equity_df, daily_df, metrics, orders, daily_store
 
@@ -132,7 +129,7 @@ def run_backtest(strategy: SP500DummyStrategy, data: pd.DataFrame, cfg: dict):
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     # 1) Strategia e configurazione
-    strategy = SP500DummyStrategy()
+    strategy = BuyHoldStrategy()
     cfg = strategy.get_config()
 
     _hr("Backtest configuration")
@@ -160,7 +157,7 @@ if __name__ == "__main__":
     # 5) Metriche
     _hr("Performance metrics")
     for k, v in metrics.items():
-        print(f"{k:<22}: {v}")
+        print(f"{k:<22}: {v:.2f}")
 
     # 6) Plot risultati
     _hr("Plot")
