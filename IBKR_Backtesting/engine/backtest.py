@@ -1,11 +1,13 @@
 # engine/backtest.py
-
-from datetime import time, datetime, date
+import datetime as dt
+from datetime import time, date
 import pandas as pd
 
+from IBKR_Backtesting.engine import order
 from IBKR_Backtesting.engine.execution import ExecutionHandler
 from IBKR_Backtesting.engine.portfolio import Portfolio
 from IBKR_Backtesting.engine.order import Order
+from IBKR_Backtesting.engine.bar import Bar
 from IBKR_Backtesting.utils.performance import compute_performance, aggregate_daily_equity
 
 
@@ -85,7 +87,8 @@ class BacktestEngine:
     # METODI INTERNI
     # -------------------------------------------------------------------------
 
-    def _get_bar_price(self, bar) -> float:
+    @staticmethod
+    def _get_bar_price(bar) -> float:
         """Determina prezzo di riferimento (mid se disponibile, altrimenti close)."""
         if hasattr(bar, "mid") and bar.mid is not None:
             return float(bar.mid)
@@ -93,8 +96,17 @@ class BacktestEngine:
             return float(bar.close)
         return float("nan")
 
-    def _snapshot(self, px: float, ts: datetime) -> dict:
-        """Registra snapshot equity e lo salva nell’equity_curve."""
+    def _snapshot(self, px: float, ts: dt.datetime) -> dict:
+        """
+        Registra snapshot equity e lo salva nell’equity_curve.
+
+        Args:
+            px (float): Prezzo di riferimento del simbolo.
+            ts (datetime.datetime): Timestamp associato allo snapshot.
+
+        Returns:
+            dict: Snapshot dell'equity registrata.
+        """
         snap = self.portfolio.snapshot_equity({self.symbol: px}, ts)
         self.equity_curve.append(snap)
         return snap
@@ -120,7 +132,7 @@ class BacktestEngine:
         - M2M se non già fatto
         - Registra marker di chiusura
         """
-        d = bar.timestamp.date()
+        current_date = bar.timestamp.date()
 
         # Flat forzato
         if self.flatten_at_close:
@@ -131,9 +143,10 @@ class BacktestEngine:
                 close_order = Order(
                     self.symbol, side, qty,
                     float(self._get_bar_price(bar)),
-                    bar.timestamp, "MARKET"
+                    bar.timestamp,
+                    "MARKET"
                 )
-                filled, exec_price = self.execution.execute_order(self.symbol, close_order, bar)
+                filled, exec_price = self.execution.execute_order(order, bar)
                 if filled:
                     close_order.timestamp = bar.timestamp
                     close_order.price = exec_price
@@ -141,12 +154,12 @@ class BacktestEngine:
                     self._snapshot(self._get_bar_price(bar), bar.timestamp)
 
         # Se M2M non fatto prima, fallo ora
-        if d not in self._m2m_done_for_day:
+        if current_date not in self._m2m_done_for_day:
             px = self._get_bar_price(bar)
             m2m_snap = self._snapshot(px, bar.timestamp)
-            self._m2m_done_for_day.add(d)
+            self._m2m_done_for_day.add(current_date)
             self.daily_store.append({
-                "date": d,
+                "date": current_date,
                 "timestamp": bar.timestamp,
                 "equity_m2m": m2m_snap["equity"],
                 "note": "m2m_at_close"
@@ -154,13 +167,13 @@ class BacktestEngine:
 
         # Marker di chiusura
         self.daily_store.append({
-            "date": d,
+            "date": current_date,
             "timestamp": bar.timestamp,
             "equity_close": self.equity_curve[-1]["equity"],
             "note": "close"
         })
 
-    def _day_changed(self, current_ts: datetime) -> bool:
+    def _day_changed(self, current_ts: dt.datetime) -> bool:
         """Rileva cambio giorno per gestire multiday."""
         cd = current_ts.date()
         changed = self._last_day is not None and cd != self._last_day
@@ -190,28 +203,28 @@ class BacktestEngine:
         self._snapshot(self._get_bar_price(first), first.timestamp)
 
         # Loop principale
-        for bar in self.data.itertuples(index=False):
-            # Cambio giorno → marker (chiusura gestita a fine giornata)
-            if self._day_changed(bar.timestamp):
+        for bar in self.data.itertuples(index=False, name="Bar"):  # type: Bar
+            ts = (
+                bar.timestamp.to_pydatetime()
+                if hasattr(bar.timestamp, "to_pydatetime")
+                else bar.timestamp
+            )
+
+            if self._day_changed(ts):
                 pass
 
-            # Strategia genera ordini
             orders = self.strategy.on_bar(bar) or []
-            for order in orders:
-                filled, exec_price = self.execution.execute_order(self.symbol, order, bar)
+            for _order in orders:
+                filled, exec_price = self.execution.execute_order(_order, bar)
                 if filled:
-                    order.timestamp = bar.timestamp
-                    order.price = exec_price
-                    self.filled_orders.append(order)
+                    _order.timestamp = ts
+                    _order.price = exec_price
+                    self.filled_orders.append(_order)
 
-            # Snapshot intraday
-            self._snapshot(self._get_bar_price(bar), bar.timestamp)
-
-            # M2M
+            self._snapshot(self._get_bar_price(bar), ts)
             self._ensure_m2m(bar)
 
-            # Chiusura giornaliera
-            if bar.timestamp.time() >= self.market_close_time:
+            if ts.time() >= self.market_close_time:
                 self._close_day(bar)
 
         # --- FIX: chiudi anche l’ultimo giorno ---

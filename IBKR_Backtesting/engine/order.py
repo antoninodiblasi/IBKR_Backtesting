@@ -4,12 +4,15 @@ class Order:
     """
     Rappresenta un ordine generato dalla strategia.
     Supporta sia MARKET che LIMIT orders, con informazioni base per il backtest.
+    Compatibile con strategie multi-asset.
     """
 
-    def __init__(self, side, qty, price=None, timestamp=None, order_type="MARKET"):
+    def __init__(self, symbol, side, qty, price=None, timestamp=None, order_type="MARKET"):
         """
         Parameters
         ----------
+        symbol : str
+            Identificatore dell'asset (ticker, ISIN, ecc.).
         side : str
             Direzione dell'ordine: "BUY" o "SELL".
         qty : int or float
@@ -23,6 +26,7 @@ class Order:
             - MARKET: eseguito al prezzo della barra (con slippage).
             - LIMIT: eseguito solo se il mercato tocca il prezzo specificato.
         """
+        self.symbol = symbol              # identificatore asset
         self.side = side                  # "BUY" o "SELL"
         self.qty = qty                    # quantità
         self.price = price                # usato solo per LIMIT order
@@ -34,6 +38,7 @@ class Order:
         Rappresentazione testuale utile per debug e logging.
         """
         return (
-            f"Order(type={self.order_type}, side={self.side}, "
-            f"qty={self.qty}, price={self.price}, time={self.timestamp})"
+            f"Order(symbol={self.symbol}, type={self.order_type}, "
+            f"side={self.side}, qty={self.qty}, price={self.price}, "
+            f"time={self.timestamp})"
         )
