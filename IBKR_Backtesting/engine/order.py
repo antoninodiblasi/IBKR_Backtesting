@@ -1,44 +1,66 @@
 # engine/order.py
+from __future__ import annotations
+import datetime as dt
+
 
 class Order:
     """
     Rappresenta un ordine generato dalla strategia.
-    Supporta sia MARKET che LIMIT orders, con informazioni base per il backtest.
-    Compatibile con strategie multi-asset.
+
+    Caratteristiche:
+    - Supporta MARKET e LIMIT
+    - Compatibile con multi-asset (campo symbol obbligatorio)
+    - Validazioni basilari (side, qty, order_type)
     """
 
-    def __init__(self, symbol, side, qty, price=None, timestamp=None, order_type="MARKET"):
-        """
-        Parameters
-        ----------
-        symbol : str
-            Identificatore dell'asset (ticker, ISIN, ecc.).
-        side : str
-            Direzione dell'ordine: "BUY" o "SELL".
-        qty : int or float
-            Quantità (numero di azioni, contratti, ecc.).
-        price : float, optional
-            Prezzo limite dell'ordine. Usato solo se order_type="LIMIT".
-        timestamp : datetime, optional
-            Momento in cui l'ordine viene generato (utile per logging e plotting).
-        order_type : str
-            Tipo di ordine: "MARKET" o "LIMIT".
-            - MARKET: eseguito al prezzo della barra (con slippage).
-            - LIMIT: eseguito solo se il mercato tocca il prezzo specificato.
-        """
-        self.symbol = symbol              # identificatore asset
-        self.side = side                  # "BUY" o "SELL"
-        self.qty = qty                    # quantità
-        self.price = price                # usato solo per LIMIT order
-        self.timestamp = timestamp        # assegnato quando la strategia lo genera
-        self.order_type = order_type      # default = "MARKET"
+    def __init__(
+        self,
+        symbol: str,
+        side: str,
+        qty: int | float,
+        price: float | None = None,
+        timestamp: dt.datetime | None = None,
+        order_type: str = "MARKET",
+    ) -> None:
+        # Validazioni minime
+        side = side.upper()
+        if side not in ("BUY", "SELL"):
+            raise ValueError(f"Invalid side: {side}. Must be 'BUY' or 'SELL'.")
 
-    def __repr__(self):
-        """
-        Rappresentazione testuale utile per debug e logging.
-        """
+        order_type = order_type.upper()
+        if order_type not in ("MARKET", "LIMIT"):
+            raise ValueError(f"Invalid order_type: {order_type}. Must be 'MARKET' or 'LIMIT'.")
+
+        if qty <= 0:
+            raise ValueError("Order qty must be positive.")
+
+        if order_type == "LIMIT" and price is None:
+            raise ValueError("Limit orders must include a price.")
+
+        # Assegnazione
+        self.symbol: str = symbol
+        self.side: str = side
+        self.qty: int | float = qty
+        self.price: float | None = price
+        self.timestamp: dt.datetime | None = timestamp
+        self.order_type: str = order_type
+
+    # -------------------------------------------------------------------------
+    # Utility
+    # -------------------------------------------------------------------------
+    def is_market(self) -> bool:
+        return self.order_type == "MARKET"
+
+    def is_limit(self) -> bool:
+        return self.order_type == "LIMIT"
+
+    # -------------------------------------------------------------------------
+    # Rappresentazione leggibile
+    # -------------------------------------------------------------------------
+    def __repr__(self) -> str:
         return (
-            f"Order(symbol={self.symbol}, type={self.order_type}, "
-            f"side={self.side}, qty={self.qty}, price={self.price}, "
+            f"Order("
+            f"symbol={self.symbol}, side={self.side}, qty={self.qty}, "
+            f"type={self.order_type}, price={self.price}, "
             f"time={self.timestamp})"
         )

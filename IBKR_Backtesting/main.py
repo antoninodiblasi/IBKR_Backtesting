@@ -13,10 +13,11 @@ from IBKR_Backtesting.utils.ibkr_client import IBKRClient
 from IBKR_Backtesting.utils.data_handler import prepare_dataframe, merge_bidask_to_bars
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Utility di stampa
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _hr(title: str | None = None) -> None:
+    """Stampa una riga di separazione con titolo opzionale."""
     line = "=" * 70
     if title:
         print(f"\n{line}\n{title}\n{line}")
@@ -37,18 +38,19 @@ def _fail(msg: str) -> None:
     sys.exit(1)
 
 
-# -----------------------------------------------------------------------------
-# Validazioni rapide
-# -----------------------------------------------------------------------------
 def _require_non_empty(df: pd.DataFrame, what: str) -> None:
+    """Verifica che un DataFrame non sia vuoto."""
     if df.empty:
         _fail(f"{what} vuoto: interrompo.")
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Download OHLCV da IBKR
-# -----------------------------------------------------------------------------
+# =============================================================================
 def fetch_bars(client: IBKRClient, cfg: dict) -> pd.DataFrame:
+    """
+    Scarica barre OHLCV da IBKR e le filtra al range richiesto.
+    """
     start_dt = pd.to_datetime(cfg["start_date"])
     end_dt = pd.to_datetime(cfg["end_date"])
     days = (end_dt - start_dt).days + 1
@@ -64,22 +66,29 @@ def fetch_bars(client: IBKRClient, cfg: dict) -> pd.DataFrame:
         duration=duration_str,
         bar_size=cfg["bar_size"],
     )
+
     bars = prepare_dataframe(raw_df)
     _require_non_empty(bars, "Barre OHLCV")
+
+    # Filtro dati al range richiesto (difesa contro IBKR che può dare extra giorni)
+    bars = bars[(bars["timestamp"] >= start_dt) & (bars["timestamp"] <= end_dt)].copy()
 
     _hr("Preview OHLCV")
     print(f"Range effettivo: {bars['timestamp'].min()} → {bars['timestamp'].max()}")
     print(bars.head())
     print(bars.tail())
+
     return bars
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Download tick BID/ASK e merge con barre
-# -----------------------------------------------------------------------------
-def fetch_and_merge_ticks(
-    client: IBKRClient, cfg: dict, bars: pd.DataFrame
-) -> pd.DataFrame:
+# =============================================================================
+def fetch_and_merge_ticks(client: IBKRClient, cfg: dict, bars: pd.DataFrame) -> pd.DataFrame:
+    """
+    Scarica i tick BID/ASK e li unisce alle barre OHLCV.
+    Se non ci sono tick, ritorna solo le barre.
+    """
     _info("Scarico tick BID/ASK da IBKR...")
     ticks = client.get_historical_bidask_ticks(
         symbol=cfg["symbol"],
@@ -94,39 +103,50 @@ def fetch_and_merge_ticks(
         _warn("Nessun tick BID/ASK scaricato. Uso solo OHLCV.")
         return bars
 
+    # Salvataggio tick scaricati (utile per debug o analisi offline)
     out_file = Path(f"book_{cfg['symbol']}_{cfg['start_date']}_{cfg['end_date']}.csv")
     ticks.to_csv(out_file, index=False)
     _info(f"Salvati {len(ticks)} tick BID/ASK in {out_file.name}")
 
+    # Merge OHLCV + tick
     data = merge_bidask_to_bars(bars, ticks, on_col="timestamp")
     _require_non_empty(data, "Dataset unito OHLCV+BID/ASK")
+
+    # Filtro anche qui (difesa ridondante)
+    start_dt = pd.to_datetime(cfg["start_date"])
+    end_dt = pd.to_datetime(cfg["end_date"])
+    data = data[(data["timestamp"] >= start_dt) & (data["timestamp"] <= end_dt)].copy()
+
     return data
 
 
-# -----------------------------------------------------------------------------
-# Esecuzione backtest + report
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Backtest runner
+# =============================================================================
 def run_backtest(strategy: BuyHoldStrategy, data: pd.DataFrame, cfg: dict):
+    """
+    Crea ed esegue un backtest, restituisce equity_df, metrics, orders.
+    """
     engine = BacktestEngine(
         strategy=strategy,
         data=data,
         symbol=cfg["symbol"],
         initial_cash=cfg["initial_cash"],
     )
+
     _info("Avvio backtest...")
     t0 = perf_counter()
     engine.run()
     dt_run = perf_counter() - t0
     _info(f"Backtest completato in {dt_run:.2f}s")
 
-    # report() DEVE restituire sempre 5 valori
-    equity_df, daily_df, metrics, orders, daily_store = engine.report()
-    return equity_df, daily_df, metrics, orders, daily_store
+    equity_df, metrics, orders = engine.report()
+    return equity_df, metrics, orders
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Entry point
-# -----------------------------------------------------------------------------
+# =============================================================================
 if __name__ == "__main__":
     # 1) Strategia e configurazione
     strategy = BuyHoldStrategy()
@@ -152,7 +172,7 @@ if __name__ == "__main__":
     data = fetch_and_merge_ticks(client, cfg, bars)
 
     # 4) Backtest
-    equity_df, daily_df, metrics, orders, daily_store = run_backtest(strategy, data, cfg)
+    equity_df, metrics, orders = run_backtest(strategy, data, cfg)
 
     # 5) Metriche
     _hr("Performance metrics")

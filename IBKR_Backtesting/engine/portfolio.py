@@ -1,182 +1,179 @@
+# engine/portfolio.py
 import datetime as dt
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 
 class Portfolio:
     """
-    Portafoglio multi-asset per backtest.
+    Portafoglio multi-asset robusto per backtest.
 
-    Traccia:
-    - cash (liquidità)
-    - posizioni per simbolo (qty, avg price)
-    - PnL realizzato cumulato per simbolo
+    Tiene traccia di:
+    - liquidità (cash)
+    - posizioni per simbolo (qty, avg_price, realized_pnl cumulato)
     - storico dei fill
-    - snapshot equity con dettaglio per-asset (per visualizzazioni/tabelle)
+    - snapshot di equity/esposizioni
+
+    Logica:
+    - BUY → aumenta qty, riduce cash
+    - SELL → riduce qty, aumenta cash
+    - PnL realizzato solo al momento della chiusura (parziale o totale)
+    - Prezzo medio aggiornato solo quando si aumenta la posizione
     """
 
     def __init__(self, cash: float = 0.0, base_currency: str = "USD"):
-        self.cash = float(cash)
-        self.base_currency = base_currency
+        self.cash: float = float(cash)
+        self.base_currency: str = base_currency
 
-        # Posizioni correnti
-        self.positions: Dict[str, int] = {}        # symbol -> qty
-        self.avg_price: Dict[str, float] = {}      # symbol -> prezzo medio
+        # Stato posizioni: symbol -> {qty, avg_price, realized_pnl}
+        self._positions: Dict[str, Dict[str, float]] = {}
 
-        # PnL realizzato cumulato per simbolo
-        self.realized_pnl: Dict[str, float] = {}   # symbol -> pnl cumulato
-
-        # Storico fill (per audit/plot)
+        # Storico fill (utile per debug/logging)
         self.history: List[Dict] = []
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # LETTURE BASE
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def get_position(self, symbol: str) -> int:
-        return int(self.positions.get(symbol, 0))
+        """Quantità netta attuale di un simbolo."""
+        return int(self._positions.get(symbol, {}).get("qty", 0))
+
+    def get_avg_price(self, symbol: str) -> float:
+        """Prezzo medio di carico del simbolo (0 se flat)."""
+        return float(self._positions.get(symbol, {}).get("avg_price", 0.0))
+
+    def get_realized_pnl(self, symbol: str) -> float:
+        """PnL realizzato cumulato del simbolo."""
+        return float(self._positions.get(symbol, {}).get("realized_pnl", 0.0))
 
     def mark_to_market(self, prices: Dict[str, float]) -> float:
-        """
-        Equity = cash + ∑ qty*px correnti (solo simboli presenti).
-        """
-        equity = float(self.cash)
-        for sym, qty in self.positions.items():
+        """Equity totale = cash + valore corrente delle posizioni."""
+        equity = self.cash
+        for sym, pos in self._positions.items():
+            qty = pos["qty"]
             px = prices.get(sym)
             if px is not None:
-                equity += float(qty) * float(px)
-        return equity
+                equity += qty * px
+        return float(equity)
 
-    # -------------------------------------------------------------------------
-    # UPDATE STATO
-    # -------------------------------------------------------------------------
-    def apply_fill(self, symbol: str, side: str, qty: int, price: float, ts: dt.datetime):
+    # ------------------------------------------------------------------
+    # UPDATE: FILL
+    # ------------------------------------------------------------------
+    def apply_fill(
+            self,
+            symbol: str,
+            side: str,
+            qty: int,
+            price: float,
+            ts: Optional[dt.datetime] = None,
+    ) -> None:
         """
-        Applica un'esecuzione (fill) e aggiorna posizioni, avg price, cash e realized PnL.
+        Applica un'esecuzione (fill) aggiornando lo stato del portafoglio.
+
+        Parametri
+        ---------
+        symbol : str
+            Asset scambiato (es. ticker).
+        side : str
+            "BUY" o "SELL".
+        qty : int
+            Quantità scambiata.
+        price : float
+            Prezzo di esecuzione.
+        ts : datetime, opzionale
+            Timestamp del fill.
         """
         side = side.upper()
+        assert side in {"BUY", "SELL"}, f"Side non valido: {side}"
+
         qty = int(qty)
         price = float(price)
         signed_qty = qty if side == "BUY" else -qty
 
-        prev_qty = int(self.positions.get(symbol, 0))
-        prev_avg = float(self.avg_price.get(symbol, 0.0))
+        # Stato precedente del simbolo (se non esiste inizializza)
+        pos = self._positions.get(symbol, {"qty": 0, "avg_price": 0.0, "realized_pnl": 0.0})
+        prev_qty = pos["qty"]
+        prev_avg = pos["avg_price"]
+        realized_pnl = pos["realized_pnl"]
+
+        # Nuova quantità netta
         new_qty = prev_qty + signed_qty
 
-        # Cash: BUY riduce, SELL aumenta
-        self.cash += -signed_qty * price
+        # ------------------- Cash -------------------
+        # BUY → cash diminuisce, SELL → cash aumenta
+        self.cash -= signed_qty * price
 
-        # Prezzo medio
-        if new_qty != 0:
-            if prev_qty == 0:
-                new_avg = price
-            elif (prev_qty > 0 and signed_qty > 0) or (prev_qty < 0 and signed_qty < 0):
-                # Aggiunta nella stessa direzione
-                new_avg = (prev_avg * abs(prev_qty) + price * abs(signed_qty)) / abs(new_qty)
-            else:
-                # Riduzione: mantieni avg del residuo
-                new_avg = prev_avg
-            self.avg_price[symbol] = float(new_avg)
+        # ------------------- Prezzo medio e PnL -------------------
+        if prev_qty == 0 or (prev_qty > 0 and signed_qty > 0) or (prev_qty < 0 and signed_qty < 0):
+            # Nuova apertura o incremento nella stessa direzione → ricalcolo media
+            new_avg = (prev_avg * abs(prev_qty) + price * abs(signed_qty)) / abs(new_qty)
+        elif new_qty == 0:
+            # Posizione chiusa completamente → realizzo tutto il PnL
+            realized_pnl += prev_qty * (price - prev_avg)
+            new_avg = 0.0
         else:
-            # Posizione chiusa
-            self.avg_price[symbol] = 0.0
+            # Riduzione parziale della posizione
+            closed_qty = abs(signed_qty)  # quantità chiusa
+            realized_pnl += closed_qty * (price - prev_avg) * (1 if prev_qty > 0 else -1)
+            new_avg = prev_avg  # il residuo mantiene il prezzo medio
 
-        self.positions[symbol] = int(new_qty)
+        # ------------------- Aggiornamento stato -------------------
+        self._positions[symbol] = {
+            "qty": new_qty,
+            "avg_price": new_avg,
+            "realized_pnl": realized_pnl,
+        }
 
-        # Realized PnL del trade (se sto chiudendo parte della posizione)
-        realized_pnl = 0.0
-        if prev_qty != 0 and ((prev_qty > 0 and signed_qty < 0) or (prev_qty < 0 and signed_qty > 0)):
-            close_qty = min(abs(prev_qty), abs(signed_qty))
-            realized_pnl = close_qty * (price - prev_avg) * (1 if prev_qty > 0 else -1)
-
-        # Accumula per simbolo
-        self.realized_pnl[symbol] = float(self.realized_pnl.get(symbol, 0.0) + realized_pnl)
-
-        # Log storico
+        # ------------------- Logging storico -------------------
         self.history.append({
             "timestamp": ts,
             "symbol": symbol,
             "side": side,
-            "qty": int(qty),
-            "price": float(price),
-            "cash": float(self.cash),
-            "position": int(new_qty),
-            "avg_price": float(self.avg_price[symbol]),
-            "realized_pnl": float(realized_pnl),
-            "realized_pnl_cum": float(self.realized_pnl[symbol]),
+            "qty": qty,
+            "price": price,
+            "cash": self.cash,
+            "position": new_qty,
+            "avg_price": new_avg,
+            "realized_pnl_cum": realized_pnl,
         })
 
-    # -------------------------------------------------------------------------
-    # METRICHE PER VISUALIZZAZIONE
-    # -------------------------------------------------------------------------
-    def unrealized_pnl_by_symbol(self, prices: Dict[str, float]) -> Dict[str, float]:
-        """
-        PnL non realizzato per simbolo = qty * (px_mkt - avg_price).
-        """
+    # ------------------------------------------------------------------
+    # METRICHE
+    # ------------------------------------------------------------------
+    def unrealized_pnl(self, prices: Dict[str, float]) -> Dict[str, float]:
+        """PnL non realizzato per ogni simbolo."""
         out: Dict[str, float] = {}
-        for sym, qty in self.positions.items():
+        for sym, pos in self._positions.items():
+            qty = pos["qty"]
+            avg = pos["avg_price"]
             px = prices.get(sym)
-            if px is None:
-                continue
-            out[sym] = float(qty) * (float(px) - float(self.avg_price.get(sym, 0.0)))
+            if px is not None:
+                out[sym] = qty * (px - avg)
         return out
 
-    def holdings_table(self, prices: Dict[str, float]) -> List[Dict]:
-        """
-        Tabella per-asset pronta per DataFrame/plot:
-        - symbol, qty, avg_price, mkt_price, market_value, unrealized_pnl, realized_pnl_cum
-        """
-        rows: List[Dict] = []
-        u_pnl = self.unrealized_pnl_by_symbol(prices)
-        for sym in sorted(set(self.positions.keys()) | set(prices.keys())):
-            qty = int(self.positions.get(sym, 0))
-            avg = float(self.avg_price.get(sym, 0.0))
-            px = float(prices.get(sym, avg or 0.0))
-            mv = float(qty) * px
-            rows.append({
-                "symbol": sym,
-                "qty": qty,
-                "avg_price": avg,
-                "mkt_price": px,
-                "market_value": mv,
-                "unrealized_pnl": float(u_pnl.get(sym, 0.0)),
-                "realized_pnl_cum": float(self.realized_pnl.get(sym, 0.0)),
-            })
-        return rows
-
-    def exposures(self, prices: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
-        """
-        Ritorna esposizione totale e per simbolo (qty*px).
-        """
-        per_sym: Dict[str, float] = {}
-        total = 0.0
-        for sym, qty in self.positions.items():
+    def exposures(self, prices: Dict[str, float]) -> Dict[str, float]:
+        """Esposizione (qty * px) per ogni simbolo."""
+        out: Dict[str, float] = {}
+        for sym, pos in self._positions.items():
             px = prices.get(sym)
-            if px is None:
-                continue
-            exp = float(qty) * float(px)
-            per_sym[sym] = exp
-            total += exp
-        return float(total), {k: float(v) for k, v in per_sym.items()}
+            if px is not None:
+                out[sym] = pos["qty"] * px
+        return out
 
-    def snapshot_equity(self, prices: Dict[str, float], ts: dt.datetime) -> Dict:
+    def snapshot(self, prices: Dict[str, float], ts: dt.datetime) -> Dict:
         """
-        Snapshot completo per visualizzazioni multi-asset.
+        Snapshot dell'equity corrente = cash + posizioni mark-to-market.
         """
-        eq = self.mark_to_market(prices)
-        unreal = self.unrealized_pnl_by_symbol(prices)
-        total_exp, exp_by_sym = self.exposures(prices)
-
+        equity = self.mark_to_market(prices)
         return {
             "timestamp": ts,
-            "equity": float(eq),
+            "equity": float(equity),
             "cash": float(self.cash),
-            "positions": dict(self.positions),                   # qty per simbolo
-            "avg_price": dict(self.avg_price),                   # avg per simbolo
-            "realized_pnl_cum": dict(self.realized_pnl),         # pnl realizzato cumulato
-            "unrealized_pnl": unreal,                            # pnl non realizzato per simbolo
-            "exposure_total": float(total_exp),
-            "exposure_by_symbol": exp_by_sym,
-            "holdings_table": self.holdings_table(prices),       # righe pronte per DataFrame
+            "positions": {s: dict(p) for s, p in self._positions.items()},
         }
 
-    def __repr__(self):
-        return f"Portfolio(cash={self.cash:.2f}, positions={self.positions})"
+    # ------------------------------------------------------------------
+    # REPR
+    # ------------------------------------------------------------------
+    def __repr__(self) -> str:
+        positions = {s: p["qty"] for s, p in self._positions.items()}
+        return f"Portfolio(cash={self.cash:.2f}, positions={positions})"

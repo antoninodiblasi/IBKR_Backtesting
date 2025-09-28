@@ -7,39 +7,28 @@ from typing import Any
 
 class ExecutionHandler:
     """
-    Gestore di esecuzione ordini nel backtest.
-    - Supporto MARKET e LIMIT
+    Gestore esecuzione ordini nel backtest.
+    - Supporta MARKET e LIMIT
     - Usa bid/ask se disponibili, altrimenti fallback su close
     - Slippage, commissioni e impatto lineare
-    - Multi-asset: il simbolo si legge da order.symbol
+    - Multi-asset: simbolo preso direttamente da order.symbol
     """
 
     def __init__(self, portfolio, slippage: float = 0.0, commission: float = 0.0,
                  impact_lambda: float = 0.0) -> None:
-        """
-        Parameters
-        ----------
-        portfolio : Portfolio
-            Oggetto Portfolio.
-        slippage : float
-            Slippage percentuale (es. 0.001 = 0.1%).
-        commission : float
-            Commissione fissa per trade.
-        impact_lambda : float
-            Coefficiente di impatto lineare se qty > size disponibile.
-        """
         self.portfolio = portfolio
         self.slippage = float(slippage)
         self.commission = float(commission)
         self.impact_lambda = float(impact_lambda)
 
     # -------------------------------------------------------------------------
-    # HELPER: book dal bar
+    # HELPER: estrazione book
     # -------------------------------------------------------------------------
     @staticmethod
     def _extract_book(bar: Any) -> tuple[float, float, float, float]:
         """
-        Ritorna best bid/ask e relative size. Se mancano, fallback su close e size grandi.
+        Ritorna best bid/ask e relative size.
+        Se mancanti → fallback su close con size grandi.
         """
         bid = getattr(bar, "bid", None)
         ask = getattr(bar, "ask", None)
@@ -47,31 +36,27 @@ class ExecutionHandler:
         ask_sz = getattr(bar, "ask_size", None)
 
         if bid is None or ask is None:
-            # Fallback: usa close come proxy per mid → bid=ask=close
             close_px = float(getattr(bar, "close", 0.0))
             bid = ask = close_px
-            # Size grandi per evitare overflow artificiale
             bid_sz = ask_sz = float(getattr(bar, "volume", 0.0) or 1e9)
 
         return float(bid), float(ask), float(bid_sz), float(ask_sz)
 
     # -------------------------------------------------------------------------
-    # ESECUZIONE ORDINI (multi-asset)
+    # ESECUZIONE ORDINI
     # -------------------------------------------------------------------------
     def execute_order(self, order, bar: Any) -> tuple[bool, float | None]:
         """
-        Simula l'esecuzione di un ordine in base alla barra corrente.
-        - MARKET → esecuzione al best con slippage e impatto.
-        - LIMIT  → esecuzione solo se compatibile con il book.
-        Ritorna (filled, exec_price).
+        Simula esecuzione ordine in base al book della barra.
+        Restituisce (filled, exec_price).
         """
-
-        # Estrazione book o fallback
         bid, ask, bid_sz, ask_sz = self._extract_book(bar)
+
+        # fallback se valori NaN
         if pd.isna(bid) or pd.isna(ask):
             px = float(getattr(bar, "close", 0.0))
             bid = ask = px
-            bid_sz = ask_sz = 1e9  # size molto grandi per evitare overflow
+            bid_sz = ask_sz = 1e9
 
         exec_price: float | None = None
         filled = False
@@ -79,23 +64,22 @@ class ExecutionHandler:
         side = order.side.upper()
         otype = order.order_type.upper()
 
-        # qty come int per il portafoglio, ma float per confronti con size float
         qty_int = int(order.qty)
         qty_f = float(qty_int)
 
         # ------------------------- MARKET -------------------------
         if otype == "MARKET":
             if side == "BUY":
-                base_px = ask * (1.0 + self.slippage)
-                overflow = max(0.0, qty_f - ask_sz)  # 0.0 evita warning int/float
+                base_px = ask * (1 + self.slippage)
+                overflow = max(0.0, qty_f - ask_sz)
                 impact = self.impact_lambda * (overflow / max(ask_sz, 1.0))
-                exec_price = base_px * (1.0 + impact)
+                exec_price = base_px * (1 + impact)
                 filled = True
-            else:  # SELL
-                base_px = bid * (1.0 - self.slippage)
+            elif side == "SELL":
+                base_px = bid * (1 - self.slippage)
                 overflow = max(0.0, qty_f - bid_sz)
                 impact = self.impact_lambda * (overflow / max(bid_sz, 1.0))
-                exec_price = base_px * (1.0 - impact)
+                exec_price = base_px * (1 - impact)
                 filled = True
 
         # ------------------------- LIMIT -------------------------
@@ -103,25 +87,23 @@ class ExecutionHandler:
             lim = float(order.price)
 
             if side == "BUY" and lim >= bid:
-                # Non pagare oltre ask
                 base_px = min(lim, ask)
                 overflow = max(0.0, qty_f - ask_sz)
                 impact = self.impact_lambda * (overflow / max(ask_sz, 1.0))
-                exec_price = base_px * (1.0 + self.slippage) * (1.0 + impact)
+                exec_price = base_px * (1 + self.slippage) * (1 + impact)
                 filled = True
 
             elif side == "SELL" and lim <= ask:
-                # Non vendere sotto bid
                 base_px = max(lim, bid)
                 overflow = max(0.0, qty_f - bid_sz)
                 impact = self.impact_lambda * (overflow / max(bid_sz, 1.0))
-                exec_price = base_px * (1.0 - self.slippage) * (1.0 - impact)
+                exec_price = base_px * (1 - self.slippage) * (1 - impact)
                 filled = True
 
         # ------------------------- FILL -------------------------
         if filled and exec_price is not None:
             exec_price = float(exec_price)
-            symbol = getattr(order, "symbol")  # multi-asset: simbolo dall'ordine
+            symbol = getattr(order, "symbol")
 
             # Aggiorna portafoglio
             self.portfolio.apply_fill(
@@ -132,17 +114,17 @@ class ExecutionHandler:
                 ts=bar.timestamp
             )
 
-            # Commissione fissa
+            # Commissione
             if self.commission > 0.0:
                 self.portfolio.cash -= self.commission
 
-            # Snapshot equity con prezzo di close come proxy
-            m2m_px = float(getattr(bar, "close", exec_price))
-            equity_snapshot = self.portfolio.snapshot_equity({symbol: m2m_px}, bar.timestamp)
+            # Snapshot equity immediato con il prezzo corrente
+            mkt_price = float(getattr(bar, "close", exec_price))
+            equity_snapshot = self.portfolio.snapshot({symbol: mkt_price}, bar.timestamp)
 
             # ------------------------- LOG -------------------------
             pos = self.portfolio.get_position(symbol)
-            avg_px = getattr(self.portfolio, "avg_price", {}).get(symbol, 0.0)
+            avg_px = self.portfolio.get_avg_price(symbol)
 
             print("\n" + "-" * 78)
             print(f"[FILL] {bar.timestamp} | {side} {qty_int} {symbol} | {otype}")
@@ -150,9 +132,9 @@ class ExecutionHandler:
             print(f"       Book       : BID {bid:.4f} x {bid_sz:.0f} | ASK {ask:.4f} x {ask_sz:.0f}")
             print(f"       Bar        : O={float(bar.open):.4f} H={float(bar.high):.4f} "
                   f"L={float(bar.low):.4f} C={float(bar.close):.4f} Vol={float(bar.volume)}")
-            print(f"       Position   : {pos} @ AvgPx={float(avg_px):.4f}")
-            print(f"       Cash       : {float(self.portfolio.cash):.2f}")
-            print(f"       Equity     : {float(equity_snapshot['equity']):.2f}")
+            print(f"       Position   : {pos} @ AvgPx={avg_px:.4f}")
+            print(f"       Cash       : {self.portfolio.cash:.2f}")
+            print(f"       Equity     : {equity_snapshot['equity']:.2f}")
             print("-" * 78)
 
         return filled, exec_price
