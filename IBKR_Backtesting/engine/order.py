@@ -8,9 +8,10 @@ class Order:
     Rappresenta un ordine generato dalla strategia.
 
     Caratteristiche:
-    - Supporta MARKET e LIMIT
-    - Compatibile con multi-asset (campo symbol obbligatorio)
-    - Validazioni basilari (side, qty, order_type)
+    - Supporta MARKET e LIMIT.
+    - Compatibile con multi-asset: il campo `symbol` è sempre obbligatorio.
+    - Validazioni basilari su side, qty e order_type.
+    - Timestamp può essere assegnato dalla strategia o dal motore in fase di fill.
     """
 
     def __init__(
@@ -22,7 +23,7 @@ class Order:
         timestamp: dt.datetime | None = None,
         order_type: str = "MARKET",
     ) -> None:
-        # Validazioni minime
+        # ---------------- VALIDAZIONI ----------------
         side = side.upper()
         if side not in ("BUY", "SELL"):
             raise ValueError(f"Invalid side: {side}. Must be 'BUY' or 'SELL'.")
@@ -37,21 +38,23 @@ class Order:
         if order_type == "LIMIT" and price is None:
             raise ValueError("Limit orders must include a price.")
 
-        # Assegnazione
-        self.symbol: str = symbol
-        self.side: str = side
-        self.qty: int | float = qty
-        self.price: float | None = price
-        self.timestamp: dt.datetime | None = timestamp
-        self.order_type: str = order_type
+        # ---------------- ASSEGNAZIONE ----------------
+        self.symbol: str = symbol            # ticker TWS / asset identifier
+        self.side: str = side                # BUY o SELL
+        self.qty: int | float = qty          # quantità > 0
+        self.price: float | None = price     # solo per LIMIT
+        self.timestamp: dt.datetime | None = timestamp  # settato dal motore se mancante
+        self.order_type: str = order_type    # MARKET o LIMIT
 
     # -------------------------------------------------------------------------
     # Utility
     # -------------------------------------------------------------------------
     def is_market(self) -> bool:
+        """True se ordine di tipo MARKET."""
         return self.order_type == "MARKET"
 
     def is_limit(self) -> bool:
+        """True se ordine di tipo LIMIT."""
         return self.order_type == "LIMIT"
 
     # -------------------------------------------------------------------------

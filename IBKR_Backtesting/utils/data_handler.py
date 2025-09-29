@@ -17,11 +17,17 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         DataFrame con colonne standardizzate:
         ['timestamp','open','high','low','close','volume'],
         ordinato cronologicamente e con timestamp tz-naive.
+
+    Note multi-asset
+    ----------------
+    - Questa funzione opera su un singolo simbolo.
+    - Per strategie multi-asset devi chiamarla in loop su ciascun simbolo e
+      restituire un dict {symbol: df}.
     """
     if df.empty:
         return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
-    # Mapping esplicito (IBKR usa 'date')
+    # Mapping esplicito (IBKR usa 'date' come indice temporale)
     rename_map = {
         "date": "timestamp",
         "open": "open",
@@ -42,31 +48,42 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df[["timestamp","open","high","low","close","volume"]]
 
 
-def merge_bidask_to_bars(bars_df: pd.DataFrame, ticks_df: pd.DataFrame,
-                         on_col: str = "timestamp",
-                         direction: str = "backward",
-                         tolerance: str = "5min") -> pd.DataFrame:
+def merge_bidask_to_bars(
+    bars_df: pd.DataFrame,
+    ticks_df: pd.DataFrame,
+    *,
+    on_col: str,
+    direction: str,
+    tolerance: str,
+) -> pd.DataFrame:
     """
     Allinea i tick BID/ASK a ciascuna barra (es. 1m OHLCV) usando merge_asof.
 
-    Parameters
-    ----------
+    Parametri
+    ---------
     bars_df : pd.DataFrame
         DataFrame con barre OHLCV (output di prepare_dataframe).
     ticks_df : pd.DataFrame
         DataFrame con tick bid/ask scaricati da IBKR (colonne:
         ['timestamp','bid','ask','bid_size','ask_size']).
     on_col : str
-        Colonna di merge (default 'timestamp').
+        Colonna di merge (tipicamente 'timestamp').
     direction : str
         'backward' = ultimo tick <= timestamp della barra.
     tolerance : str
         Finestra massima per associare un tick (es. "5min").
 
-    Returns
+    Ritorna
     -------
     pd.DataFrame
         DataFrame OHLCV con colonne aggiuntive bid/ask/bid_size/ask_size + mid.
+
+    Note multi-asset
+    ----------------
+    - Funziona su un solo simbolo.
+    - Per più simboli va chiamata per ciascun df separatamente.
+    - Parametri `on_col`, `direction` e `tolerance` devono provenire da strategy.get_config(),
+      in modo che ogni strategia decida come vuole allineare i dati.
     """
     if bars_df.empty:
         return bars_df
